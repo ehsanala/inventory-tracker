@@ -1,290 +1,255 @@
 from collections import defaultdict
 from pathlib import Path
-import sqlite3
-
 import streamlit as st
 import altair as alt
 import pandas as pd
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import matplotlib.pyplot as plt
+from pytrends.request import TrendReq
+import time
+from pytrends.exceptions import TooManyRequestsError
 
+# Function to fetch Google Trends with retry logic and exponential backoff
+@st.cache_data(ttl=86400)
+def fetch_google_trends(keyword, timeframe='today 3-m', retries=3, sleep_base=5):
+    pytrends = TrendReq(hl='en-US', tz=360)
+    for attempt in range(retries):
+        try:
+            pytrends.build_payload([keyword], timeframe=timeframe)
+            data = pytrends.interest_over_time()
+            if data.empty:
+                return pd.DataFrame(columns=['Date', 'Google_Trend'])
+            return data.reset_index()[['date', keyword]].rename(columns={'date': 'Date', keyword: 'Google_Trend'})
+        except TooManyRequestsError as e:
+            time.sleep(sleep_base * (attempt + 1))
+        except Exception as e:
+            st.warning(f"⚠️ Google Trends fetch failed: {e}")
+            break
+    st.warning(f"⚠️ Google Trends unavailable after {retries} attempts.")
+    return pd.DataFrame(columns=['Date', 'Google_Trend'])
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title="Inventory tracker",
-    page_icon=":shopping_bags:",  # This is an emoji shortcode. Could be a URL too.
-)
+# Set up enhanced page config and theme
+st.set_page_config(page_title="MindGames Dashboard", layout="wide", page_icon="🧠")
 
+# Custom CSS for modern UI
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+            max-width: 1400px;
+            margin: auto;
+        }
+        h1, h2, h3 {
+            color: #1E293B;
+            font-family: 'Segoe UI', sans-serif;
+        }
+        .metric-box {
+            background: linear-gradient(to right, #6366F1, #3B82F6);
+            color: white;
+            padding: 1.2rem;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.1);
+        }
+        .section {
+            margin-top: 2rem;
+            margin-bottom: 1rem;
+            border-bottom: 2px solid #E5E7EB;
+            padding-bottom: 0.5rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Header
+st.markdown("""
+    <div style="text-align:center">
+        <h1>🧠 MindGames Inventory Intelligence</h1>
+        <p style="color:gray">Monitor, Forecast & Optimize Inventory Across All Locations</p>
+    </div>
+""", unsafe_allow_html=True)
 
-
-def connect_db():
-    """Connects to the sqlite database."""
-
-    DB_FILENAME = Path(__file__).parent / "inventory.db"
-    db_already_exists = DB_FILENAME.exists()
-
-    conn = sqlite3.connect(DB_FILENAME)
-    db_was_just_created = not db_already_exists
-
-    return conn, db_was_just_created
-
-
-def initialize_data(conn):
-    """Initializes the inventory table with some data."""
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT,
-            price REAL,
-            units_sold INTEGER,
-            units_left INTEGER,
-            cost_price REAL,
-            reorder_point INTEGER,
-            description TEXT
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        INSERT INTO inventory
-            (item_name, price, units_sold, units_left, cost_price, reorder_point, description)
-        VALUES
-            -- Beverages
-            ('Bottled Water (500ml)', 1.50, 115, 15, 0.80, 16, 'Hydrating bottled water'),
-            ('Soda (355ml)', 2.00, 93, 8, 1.20, 10, 'Carbonated soft drink'),
-            ('Energy Drink (250ml)', 2.50, 12, 18, 1.50, 8, 'High-caffeine energy drink'),
-            ('Coffee (hot, large)', 2.75, 11, 14, 1.80, 5, 'Freshly brewed hot coffee'),
-            ('Juice (200ml)', 2.25, 11, 9, 1.30, 5, 'Fruit juice blend'),
-
-            -- Snacks
-            ('Potato Chips (small)', 2.00, 34, 16, 1.00, 10, 'Salted and crispy potato chips'),
-            ('Candy Bar', 1.50, 6, 19, 0.80, 15, 'Chocolate and candy bar'),
-            ('Granola Bar', 2.25, 3, 12, 1.30, 8, 'Healthy and nutritious granola bar'),
-            ('Cookies (pack of 6)', 2.50, 8, 8, 1.50, 5, 'Soft and chewy cookies'),
-            ('Fruit Snack Pack', 1.75, 5, 10, 1.00, 8, 'Assortment of dried fruits and nuts'),
-
-            -- Personal Care
-            ('Toothpaste', 3.50, 1, 9, 2.00, 5, 'Minty toothpaste for oral hygiene'),
-            ('Hand Sanitizer (small)', 2.00, 2, 13, 1.20, 8, 'Small sanitizer bottle for on-the-go'),
-            ('Pain Relievers (pack)', 5.00, 1, 5, 3.00, 3, 'Over-the-counter pain relief medication'),
-            ('Bandages (box)', 3.00, 0, 10, 2.00, 5, 'Box of adhesive bandages for minor cuts'),
-            ('Sunscreen (small)', 5.50, 6, 5, 3.50, 3, 'Small bottle of sunscreen for sun protection'),
-
-            -- Household
-            ('Batteries (AA, pack of 4)', 4.00, 1, 5, 2.50, 3, 'Pack of 4 AA batteries'),
-            ('Light Bulbs (LED, 2-pack)', 6.00, 3, 3, 4.00, 2, 'Energy-efficient LED light bulbs'),
-            ('Trash Bags (small, 10-pack)', 3.00, 5, 10, 2.00, 5, 'Small trash bags for everyday use'),
-            ('Paper Towels (single roll)', 2.50, 3, 8, 1.50, 5, 'Single roll of paper towels'),
-            ('Multi-Surface Cleaner', 4.50, 2, 5, 3.00, 3, 'All-purpose cleaning spray'),
-
-            -- Others
-            ('Lottery Tickets', 2.00, 17, 20, 1.50, 10, 'Assorted lottery tickets'),
-            ('Newspaper', 1.50, 22, 20, 1.00, 5, 'Daily newspaper')
-        """
-    )
-    conn.commit()
-
-
-def load_data(conn):
-    """Loads the inventory data from the database."""
-    cursor = conn.cursor()
-
+# Sidebar filters
+inventory_file = st.sidebar.file_uploader("Upload inventory snapshot (CSV)", type="csv", key="inv")
+sales_file = st.sidebar.file_uploader("Upload sales history (item_name, Date, Units_Sold, location)", type="csv", key="sales_history")
+st.sidebar.header("📂 Filters")
+sku_file = st.sidebar.file_uploader("Upload SKU list (CSV or TXT)", type=["csv", "txt"])
+sku_list = []
+if sku_file:
     try:
-        cursor.execute("SELECT * FROM inventory")
-        data = cursor.fetchall()
-    except:
-        return None
+        sku_df = pd.read_csv(sku_file, header=None)
+        sku_list = sku_df[0].astype(str).tolist()
+    except Exception as e:
+        st.error(f"Error reading SKU file: {e}")
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "id",
-            "item_name",
-            "price",
-            "units_sold",
-            "units_left",
-            "cost_price",
-            "reorder_point",
-            "description",
-        ],
-    )
+trend_keyword = st.sidebar.text_input("🔍 Enter keyword for Google Trends", value="Magic Cards")
 
-    return df
+# Load inventory data directly from uploaded CSV or fallback
+if inventory_file:
+    df = pd.read_csv(inventory_file)
+else:
+    st.warning("⚠️ Please upload an inventory snapshot CSV file.")
+    st.stop()
 
+categories = df["category"].dropna().unique().tolist()
+suppliers = df["supplier"].dropna().unique().tolist()
+locations = df["location"].dropna().unique().tolist()
 
-def update_data(conn, df, changes):
-    """Updates the inventory data in the database."""
-    cursor = conn.cursor()
+selected_categories = st.sidebar.multiselect("Category", categories)
+selected_suppliers = st.sidebar.multiselect("Supplier", suppliers)
+selected_locations = st.sidebar.multiselect("Location", locations)
 
-    if changes["edited_rows"]:
-        deltas = st.session_state.inventory_table["edited_rows"]
-        rows = []
+region_scope = st.sidebar.radio("Select Region Scope", ["All", "CA", "US"], index=0)
 
-        for i, delta in deltas.items():
-            row_dict = df.iloc[i].to_dict()
-            row_dict.update(delta)
-            rows.append(row_dict)
+@st.cache_data(ttl=300)
+def get_filtered_data(df, categories, suppliers, locations, sku_list, region_scope):
+    if region_scope == "CA":
+        df = df[df["location"].str.contains("CA") | (df["location"] == "Main Warehouse")]
+    elif region_scope == "US":
+        df = df[df["location"].str.contains("US")]
 
-        cursor.executemany(
-            """
-            UPDATE inventory
-            SET
-                item_name = :item_name,
-                price = :price,
-                units_sold = :units_sold,
-                units_left = :units_left,
-                cost_price = :cost_price,
-                reorder_point = :reorder_point,
-                description = :description
-            WHERE id = :id
-            """,
-            rows,
-        )
+    supplier_filter = df["supplier"].isin(suppliers) if suppliers else pd.Series([True] * len(df))
+    category_filter = df["category"].isin(categories) if categories else pd.Series([True] * len(df))
+    location_filter = df["location"].isin(locations) if locations else pd.Series([True] * len(df))
+    filtered = df[supplier_filter & category_filter & location_filter]
 
-    if changes["added_rows"]:
-        cursor.executemany(
-            """
-            INSERT INTO inventory
-                (id, item_name, price, units_sold, units_left, cost_price, reorder_point, description)
-            VALUES
-                (:id, :item_name, :price, :units_sold, :units_left, :cost_price, :reorder_point, :description)
-            """,
-            (defaultdict(lambda: None, row) for row in changes["added_rows"]),
-        )
+    if sku_list:
+        filtered = filtered[filtered['item_name'].astype(str).isin(sku_list)]
+    return filtered
 
-    if changes["deleted_rows"]:
-        cursor.executemany(
-            "DELETE FROM inventory WHERE id = :id",
-            ({"id": int(df.loc[i, "id"])} for i in changes["deleted_rows"]),
-        )
+filtered_df = get_filtered_data(df, selected_categories, selected_suppliers, selected_locations, sku_list, region_scope)
 
-    conn.commit()
+# Compute KPIs
+filtered_df["margin_%"] = ((filtered_df["price"] - filtered_df["cost_price"]) / filtered_df["price"] * 100).round(2)
+filtered_df["stock_value"] = (filtered_df["cost_price"] * filtered_df["units_left"]).round(2)
+filtered_df["inventory_turnover"] = (filtered_df["units_sold"] / (filtered_df["units_sold"] + filtered_df["units_left"] + 1e-9)).round(2)
 
+# KPI layout
+st.markdown('<div class="section"><h2>📊 Key Metrics</h2></div>', unsafe_allow_html=True)
+col1, col2, col3 = st.columns(3)
+col1.markdown(f"<div class='metric-box'><h3>${filtered_df['stock_value'].sum():,.2f}</h3><p>Total Stock Value</p></div>", unsafe_allow_html=True)
+col2.markdown(f"<div class='metric-box'><h3>{filtered_df['margin_%'].mean():.2f}%</h3><p>Avg Margin</p></div>", unsafe_allow_html=True)
+col3.markdown(f"<div class='metric-box'><h3>{filtered_df['inventory_turnover'].mean():.2f}</h3><p>Inventory Turnover</p></div>", unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# Draw the actual page, starting with the inventory table.
+# Inventory Table
+st.markdown('<div class="section"><h2>📋 Inventory Table</h2></div>', unsafe_allow_html=True)
+page_size = 50
+max_pages = max((len(filtered_df) - 1) // page_size + 1, 1)
+page = st.number_input("Page", min_value=1, max_value=max_pages, value=1, step=1)
+paginated_df = filtered_df.iloc[(page - 1) * page_size: page * page_size]
+st.dataframe(paginated_df, use_container_width=True)
 
-# Set the title that appears at the top of the page.
-"""
-# :shopping_bags: Inventory tracker
+# Low stock
+st.markdown('<div class="section"><h2>🧯 Low Stock Alerts</h2></div>', unsafe_allow_html=True)
+low_stock = filtered_df[filtered_df["units_left"] < filtered_df["reorder_point"]]
+if not low_stock.empty:
+    st.warning("Some items are below reorder threshold.")
+    st.dataframe(low_stock[["item_name", "location", "units_left", "reorder_point"]])
 
-**Welcome to Alice's Corner Store's intentory tracker!**
-This page reads and writes directly from/to our inventory database.
-"""
-
-st.info(
-    """
-    Use the table below to add, remove, and edit items.
-    And don't forget to commit your changes when you're done.
-    """
-)
-
-# Connect to database and create table if needed
-conn, db_was_just_created = connect_db()
-
-# Initialize data.
-if db_was_just_created:
-    initialize_data(conn)
-    st.toast("Database initialized with some sample data.")
-
-# Load data from database
-df = load_data(conn)
-
-# Display data with editable table
-edited_df = st.data_editor(
-    df,
-    disabled=["id"],  # Don't allow editing the 'id' column.
-    num_rows="dynamic",  # Allow appending/deleting rows.
-    column_config={
-        # Show dollar sign before price columns.
-        "price": st.column_config.NumberColumn(format="$%.2f"),
-        "cost_price": st.column_config.NumberColumn(format="$%.2f"),
-    },
-    key="inventory_table",
-)
-
-has_uncommitted_changes = any(len(v) for v in st.session_state.inventory_table.values())
-
-st.button(
-    "Commit changes",
-    type="primary",
-    disabled=not has_uncommitted_changes,
-    # Update data in database
-    on_click=update_data,
-    args=(conn, df, st.session_state.inventory_table),
-)
-
-
-# -----------------------------------------------------------------------------
-# Now some cool charts
-
-# Add some space
-""
-""
-""
-
-st.subheader("Units left", divider="red")
-
-need_to_reorder = df[df["units_left"] < df["reorder_point"]].loc[:, "item_name"]
-
-if len(need_to_reorder) > 0:
-    items = "\n".join(f"* {name}" for name in need_to_reorder)
-
-    st.error(f"We're running dangerously low on the items below:\n {items}")
-
-""
-""
-
+# Charts
+st.markdown('<div class="section"><h2>🔥 Top Sellers</h2></div>', unsafe_allow_html=True)
 st.altair_chart(
-    # Layer 1: Bar chart.
-    alt.Chart(df)
-    .mark_bar(
-        orient="horizontal",
-    )
-    .encode(
-        x="units_left",
-        y="item_name",
-    )
-    # Layer 2: Chart showing the reorder point.
-    + alt.Chart(df)
-    .mark_point(
-        shape="diamond",
-        filled=True,
-        size=50,
-        color="salmon",
-        opacity=1,
-    )
-    .encode(
-        x="reorder_point",
-        y="item_name",
-    ),
-    use_container_width=True,
+    alt.Chart(filtered_df).mark_bar(orient="horizontal").encode(
+        x="units_sold", y=alt.Y("item_name").sort("-x"), tooltip=["units_sold", "item_name"]
+    ), use_container_width=True
 )
 
-st.caption("NOTE: The :diamonds: location shows the reorder point.")
-
-""
-""
-""
-
-# -----------------------------------------------------------------------------
-
-st.subheader("Best sellers", divider="orange")
-
-""
-""
-
-st.altair_chart(
-    alt.Chart(df)
-    .mark_bar(orient="horizontal")
-    .encode(
-        x="units_sold",
-        y=alt.Y("item_name").sort("-x"),
-    ),
-    use_container_width=True,
+# Category/Supplier
+st.markdown('<div class="section"><h2>📦 Category Summary</h2></div>', unsafe_allow_html=True)
+st.dataframe(
+    filtered_df.groupby("category").agg(
+        total_stock_value=("stock_value", "sum"),
+        avg_margin=("margin_%", "mean"),
+        turnover=("inventory_turnover", "mean")
+    ).round(2).reset_index()
 )
+
+st.markdown('<div class="section"><h2>🤝 Supplier Summary</h2></div>', unsafe_allow_html=True)
+st.dataframe(
+    filtered_df.groupby("supplier").agg(
+        total_stock_value=("stock_value", "sum"),
+        avg_margin=("margin_%", "mean"),
+        turnover=("inventory_turnover", "mean")
+    ).round(2).reset_index()
+)
+
+# Forecasting & Lifecycle
+# if sales_file:
+#     try:
+#         sales_data = pd.read_csv(sales_file, parse_dates=["Date"])
+#         sales_data = sales_data.sort_values(["item_name", "Date"])
+
+#         trend_data = fetch_google_trends(trend_keyword)
+#         if not trend_data.empty:
+#             sales_data = pd.merge(sales_data, trend_data, on="Date", how="left")
+
+#         st.markdown('<div class="section"><h2>🧠 Product Lifecycle Classification</h2></div>', unsafe_allow_html=True)
+#         last_date = sales_data["Date"].max()
+#         sales_by_item = sales_data.groupby("item_name").agg(
+#             last_sale=("Date", "max"),
+#             total_sales=("Units_Sold", "sum"),
+#             days_active=("Date", lambda x: (x.max() - x.min()).days + 1),
+#             unique_weeks=("Date", lambda x: len(set(x.dt.to_period("W"))))
+#         ).reset_index()
+
+#         def classify(row):
+#             days_since_last = (last_date - row["last_sale"]).days
+#             if days_since_last > 180:
+#                 return "❌ Outdated (No Sales 6+ Months)"
+#             elif row["unique_weeks"] >= 20:
+#                 return "✅ Evergreen (Always in Stock)"
+#             elif row["unique_weeks"] > 5:
+#                 return "🎯 Seasonal"
+#             else:
+#                 return "📉 Low Activity"
+
+#         sales_by_item["Lifecycle Category"] = sales_by_item.apply(classify, axis=1)
+#         st.dataframe(sales_by_item[["item_name", "last_sale", "total_sales", "Lifecycle Category"]])
+
+#         st.markdown('<div class="section"><h2>📈 Forecasting & Demand Planning</h2></div>', unsafe_allow_html=True)
+#         today = pd.Timestamp.today()
+#         summary_rows = []
+
+#         for sku in sales_data["item_name"].unique():
+#             for location in sales_data["location"].unique():
+#                 df_item = sales_data[
+#                     (sales_data["item_name"] == sku) &
+#                     (sales_data["location"] == location)
+#                 ].set_index("Date")["Units_Sold"].resample("D").sum().fillna(0)
+
+#                 row = {"Item": sku, "Location": location}
+#                 row["Last 30 Days"] = df_item[-30:].sum()
+#                 row["Last 60 Days"] = df_item[-60:].sum()
+#                 row["Last 90 Days"] = df_item[-90:].sum()
+#                 row["YTD"] = df_item[df_item.index >= pd.Timestamp(today.year, 1, 1)].sum()
+
+#                 last_year = today.year - 1
+#                 for days in [30, 60, 90]:
+#                     ly_start = today.replace(year=last_year)
+#                     ly_end = ly_start + pd.Timedelta(days=days)
+#                     mask = (df_item.index >= ly_start) & (df_item.index < ly_end)
+#                     row[f"Next {days} LY"] = df_item.loc[mask].sum()
+
+#                 if len(df_item) >= 60 and sku in sales_by_item[sales_by_item['Lifecycle Category'] != '❌ Outdated (No Sales 6+ Months)']["item_name"].values:
+#                     model = ExponentialSmoothing(df_item, trend="add", seasonal=None).fit()
+#                     forecast = model.forecast(30)
+#                     forecast_total = forecast.sum()
+#                     row["Forecast Next 30"] = forecast_total
+#                     row["Lifecycle"] = sales_by_item[sales_by_item["item_name"] == sku]["Lifecycle Category"].values[0]
+
+#                     current_stock = filtered_df[(filtered_df["item_name"] == sku) & (filtered_df["location"] == location)]
+#                     units_left = int(current_stock["units_left"].values[0]) if not current_stock.empty else 0
+#                     reorder_qty = max(int(forecast_total) - units_left, 0)
+#                     row["Units Left"] = units_left
+#                     row["Suggested Reorder"] = reorder_qty
+
+#                 summary_rows.append(row)
+
+#         demand_df = pd.DataFrame(summary_rows)
+#         st.dataframe(demand_df, use_container_width=True)
+#         st.download_button("⬇ Download Demand Plan", demand_df.to_csv(index=False), "demand_plan.csv")
+
+#     except Exception as e:
+#         st.error(f"Error processing sales file: {e}")
+
+st.caption("Made for MindGames — Powered by Streamlit | All metrics reflect applied filters.")
