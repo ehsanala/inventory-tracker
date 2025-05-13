@@ -3,7 +3,7 @@ from pathlib import Path
 import streamlit as st
 import altair as alt
 import pandas as pd
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+# from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import matplotlib.pyplot as plt
 from pytrends.request import TrendReq
 import time
